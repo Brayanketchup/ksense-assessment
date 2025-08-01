@@ -53,52 +53,87 @@ function ageScore(age) {
 }
 
 async function fetchPatients() {
-    let page = 1;
-    const allPatients = [];
+  const allPatients = [];
+  const failedPages = new Set();
+  const totalPages = 10;
 
-    while (true) {
-        let retries = 0;
-        while (retries < MAX_RETRIES) {
-            try {
-                console.log(`fetching page ${page}...`);
-                const res = await axios.get(`${BASE_URL}/patients?page=${page}&limit=5`, {
-                    headers: HEADERS,
-                });
-                const data = res.data;
-                if (!data.data || !Array.isArray(data.data)) {
-                    console.warn(`malformed response on page ${page}. Skipping...`);
-                    break; 
-                }
+  
+  for (let page = 1; page <= totalPages; page++) {
+    const success = await fetchAndStorePage(page, allPatients);
+    if (!success) failedPages.add(page);
+  }
 
-                allPatients.push(...data.data);
-
-                if (!data.pagination.hasNext) return allPatients;
-                page++;
-
-                await new Promise(res => setTimeout(res, 1500));
-                break;
-            } catch (err) {
-                const status = err.response?.status;
-                if (status === 429) {
-                    retries++;
-                    console.warn(`rate limited on page ${page}. Waiting 4s (retry ${retries})...`);
-                    await new Promise(res => setTimeout(res, 4000));
-                } else if (status === 500 || status === 503) {
-                    retries++;
-                    console.warn(`server error on page ${page}. Retrying in 2s (retry ${retries})...`);
-                    await new Promise(res => setTimeout(res, 2000));
-                } else {
-                    console.error('unexpected error:', err.message);
-                    return allPatients;
-                }
-            }
-        }
-
-        if (retries === MAX_RETRIES) {
-            console.error(`failed after ${MAX_RETRIES} retries on page ${page}. stopping.`);
-            return allPatients;
-        }
+  
+  if (failedPages.size > 0) {
+    console.log(`\nretrying failed pages: ${[...failedPages].join(', ')}`);
+    for (const page of failedPages) {
+      const success = await fetchAndStorePage(page, allPatients, 8);
+      if (!success) {
+        console.error(`page ${page} permanently failed after retries.`);
+      }
     }
+  }
+
+  console.log(`\nfinal patient count: ${allPatients.length}`);
+  return allPatients;
+}
+
+
+
+async function fetchAndStorePage(page, allPatients, maxRetries = 5) {
+  let retries = 0;
+  while (retries < maxRetries) {
+    try {
+      console.log(`\nfetching page ${page} (attempt ${retries + 1})...`);
+      const res = await axios.get(`${BASE_URL}/patients?page=${page}&limit=5`, {
+        headers: HEADERS,
+      });
+      const data = res.data;
+
+      console.log(`Raw api response from page ${page}:`);
+
+      console.dir(data, { depth: null });
+
+      let patients = [];
+
+      if (Array.isArray(data.data)) {
+        patients = data.data;
+        
+      } else if (data.data && typeof data.data === 'object') {
+        patients = Object.values(data.data).filter(p => p?.patient_id);
+      } else if (Array.isArray(data.patients)) {
+        patients = data.patients;
+      }
+
+      const validPatients = patients.filter(p => p && p.patient_id);
+      if (validPatients.length === 0) {
+        throw new Error(`page ${page} contained no valid patient records`);
+      }
+
+      allPatients.push(...validPatients);
+      console.log(`extracted ${validPatients.length} patient from page ${page}`);
+      return true;
+
+    } catch (err) {
+      const status = err.response?.status;
+
+      if (status === 429) {
+        const waitTime = 4000 + 1000 * retries;
+        console.warn(`rate limited on page ${page}. Waiting ${waitTime / 1000}s...`);
+        await new Promise(res => setTimeout(res, waitTime));
+      } else if (status === 500 || status === 503 || err.message.includes('no valid')) {
+        console.warn(`server/format issue on page ${page}, retrying...`);
+        await new Promise(res => setTimeout(res, 2000));
+      } else {
+        console.error(`unexpected error on page ${page}:`, err.message);
+        return false;
+      }
+
+      retries++;
+    }
+  }
+
+  return false;
 }
 
 function analyze(patients) {
